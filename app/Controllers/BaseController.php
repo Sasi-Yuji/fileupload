@@ -42,4 +42,19 @@ abstract class BaseController extends Controller
         // Preload any models, libraries, etc, here.
         // $this->session = service('session');
     }
+
+    protected function auditLog($action, $target = null, $details = null)
+    {
+        $auditModel = new \App\Models\AuditLogModel();
+        $session = session();
+        
+        $auditModel->insert([
+            'user_id'    => $session->get('id'),
+            'action'     => $action,
+            'target'     => $target,
+            'details'    => is_array($details) ? json_encode($details) : $details,
+            'ip_address' => $this->request->getIPAddress(),
+            'user_agent' => (string) $this->request->getUserAgent(),
+        ]);
+    }
 }

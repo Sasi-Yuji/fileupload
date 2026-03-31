@@ -4,6 +4,8 @@ namespace App\Controllers;
 
 use App\Models\StudentModel;
 use App\Models\CertificateModel;
+use App\Services\GoogleDriveService;
+use App\Services\MessagingService;
 
 class StudentController extends BaseController
 {
@@ -20,6 +22,12 @@ class StudentController extends BaseController
 
         // Sorting by updated_at DESC (which will show the latest edited or added records first)
         $data['students'] = $model->orderBy('updated_at', 'DESC')->orderBy('id', 'DESC')->findAll();
+        
+        // Stats
+        $data['total_students'] = count($data['students']);
+        $data['pending_count'] = $model->where('status', 'pending')->countAllResults();
+        $data['approved_count'] = $model->where('status', 'approved')->countAllResults();
+
         return view('student_list', $data);
     }
 
@@ -81,6 +89,21 @@ class StudentController extends BaseController
         $signatureData = $this->request->getPost('signature_data');
         $signatureName = $this->saveBase64Image($signatureData, 'uploads/signature/');
 
+        // 🔹 Per-student disk quota check (10MB)
+        $estimatedStudentSize = ($profile->getSize() + $resume->getSize() + $idProof->getSize());
+        $sigSize = strlen(base64_decode(explode(',', $this->request->getPost('signature_data'))[1] ?? ''));
+        $estimatedStudentSize += $sigSize + $totalCertSize;
+        $quotaLimitBytes = 10 * 1024 * 1024; // 10 MB per student
+        if ($estimatedStudentSize > $quotaLimitBytes) {
+            return redirect()->back()->withInput()->with('errors', [
+                'quota' => 'Total file size for this student exceeds the 10MB quota (' . round($estimatedStudentSize / 1048576, 2) . ' MB used).'
+            ]);
+        }
+
+        // 🔹 Calculate Digital Signature Hash (Fingerprint)
+        $fingerprintData = $this->request->getPost('name') . $this->request->getPost('email') . $profileName . time();
+        $digitalHash = hash('sha256', $fingerprintData);
+
         $studentData = [
             'name' => $this->request->getPost('name'),
             'email' => $this->request->getPost('email'),
@@ -90,10 +113,25 @@ class StudentController extends BaseController
             'resume' => $resumeName,
             'id_proof' => $idProofName,
             'signature' => $signatureName,
+            'digital_signature_hash' => $digitalHash,
         ];
 
         $studentModel->insert($studentData);
-        $studentId = $studentModel->insertID();
+        $studentId = $studentModel->getInsertID();
+
+        // 🔹 Audit Log
+        $this->auditLog('student_create', $studentId, ['name' => $studentData['name'], 'hash' => $digitalHash]);
+
+        // 🔹 Ecosystem Integration: Cloud Sync
+        $googleDrive = new GoogleDriveService();
+        $syncResult = $googleDrive->syncStudentRecord($studentId, $studentData['name']);
+
+        // 🔹 Ecosystem Integration: Automated Messaging
+        $messaging = new MessagingService();
+        $msgResult = $messaging->sendRegistrationConfirmation($studentData['phone'], $studentData['name']);
+
+        // 🔹 Audit Log (Ecosystem Events)
+        $this->auditLog('ecosystem_sync', $studentId, ['drive' => $syncResult['status'], 'sms' => $msgResult['status']]);
 
         // 🔹 Upload multiple certificates
         foreach ($certificates as $file) {
@@ -265,6 +303,208 @@ class StudentController extends BaseController
     }
 
 
+
+    // ─── Storage Stats API ─────────────────────────────────────────────
+    /**
+     * Returns JSON with disk usage broken down by file type folder.
+     * Used by the dashboard storage widget.
+     */
+    public function storageStats()
+    {
+        return $this->response->setJSON($this->getStorageStats());
+    }
+
+    /**
+     * Calculates actual disk usage per upload sub-folder.
+     * Returns bytes + human-readable size for each type and a grand total.
+     */
+    private function getStorageStats(): array
+    {
+        $basePath = FCPATH . 'uploads/';
+        $folders  = [
+            'Photos'       => 'profile',
+            'Resumes'      => 'resume',
+            'ID Proofs'    => 'id_proof',
+            'Signatures'   => 'signature',
+            'Certificates' => 'certificates',
+        ];
+
+        $stats = [];
+        $totalBytes = 0;
+
+        foreach ($folders as $label => $dir) {
+            $path  = $basePath . $dir . '/';
+            $files = is_dir($path) ? glob($path . '*') : [];
+            $files = array_filter($files, 'is_file');
+            $bytes = empty($files) ? 0 : array_sum(array_map('filesize', $files));
+            $totalBytes += $bytes;
+            $stats[$label] = [
+                'bytes'      => $bytes,
+                'human'      => $this->formatBytes($bytes),
+                'file_count' => count($files),
+            ];
+        }
+
+        // Quota config: warn at 80%, critical at 95%
+        $quotaBytes = 500 * 1024 * 1024; // 500 MB soft limit
+        $usedPercent = $quotaBytes > 0 ? round(($totalBytes / $quotaBytes) * 100, 1) : 0;
+
+        return [
+            'breakdown'    => $stats,
+            'total_bytes'  => $totalBytes,
+            'total_human'  => $this->formatBytes($totalBytes),
+            'quota_bytes'  => $quotaBytes,
+            'quota_human'  => $this->formatBytes($quotaBytes),
+            'used_percent' => $usedPercent,
+            'status'       => $usedPercent >= 95 ? 'critical' : ($usedPercent >= 80 ? 'warning' : 'ok'),
+        ];
+    }
+
+    /** Human-readable file size formatter */
+    private function formatBytes(int $bytes, int $precision = 2): string
+    {
+        if ($bytes <= 0) return '0 B';
+        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        $i = (int) floor(log($bytes, 1024));
+        return round($bytes / pow(1024, $i), $precision) . ' ' . $units[$i];
+    }
+
+    /**
+     * Calculates total disk usage for a single student (all file types).
+     * Used for per-student quota enforcement.
+     */
+    private function getStudentDiskUsage(array $student): int
+    {
+        $total = 0;
+        $checks = [
+            FCPATH . 'uploads/profile/'       => $student['profile_photo'] ?? '',
+            FCPATH . 'uploads/resume/'        => $student['resume'] ?? '',
+            FCPATH . 'uploads/id_proof/'      => $student['id_proof'] ?? '',
+            FCPATH . 'uploads/signature/'     => $student['signature'] ?? '',
+        ];
+        foreach ($checks as $dir => $file) {
+            if ($file && file_exists($dir . $file)) {
+                $total += filesize($dir . $file);
+            }
+        }
+        // Certificates
+        $certModel = new CertificateModel();
+        $certs = $certModel->where('student_id', $student['id'])->findAll();
+        foreach ($certs as $cert) {
+            $p = FCPATH . 'uploads/certificates/' . $cert['file_name'];
+            if (file_exists($p)) $total += filesize($p);
+        }
+        return $total;
+    }
+
+    // ─── Filtered / Chunked Bulk Export ───────────────────────────────
+    /**
+     * Exports student documents as a ZIP, with optional filters:
+     *   ?department=CS&status=approved&from=2025-01-01&to=2025-12-31
+     *
+     * Replaces the old all-at-once exportZip().
+     */
+    public function exportZip()
+    {
+        $studentModel    = new StudentModel();
+        $certificateModel = new CertificateModel();
+
+        // ── Read filters from GET ──
+        $filterDept   = $this->request->getGet('department');
+        $filterStatus = $this->request->getGet('status');
+        $filterFrom   = $this->request->getGet('from');   // YYYY-MM-DD
+        $filterTo     = $this->request->getGet('to');     // YYYY-MM-DD
+
+        $query = $studentModel->orderBy('id', 'ASC');
+
+        if (!empty($filterDept)) {
+            $query->where('department', $filterDept);
+        }
+        if (!empty($filterStatus)) {
+            $query->where('status', $filterStatus);
+        }
+        if (!empty($filterFrom)) {
+            $query->where('created_at >=', $filterFrom . ' 00:00:00');
+        }
+        if (!empty($filterTo)) {
+            $query->where('created_at <=', $filterTo . ' 23:59:59');
+        }
+
+        $students = $query->findAll();
+
+        if (empty($students)) {
+            return redirect()->back()->with('error', 'No students match the selected filters.');
+        }
+
+        // Enforce a safe chunk limit to prevent timeouts
+        $chunkLimit = 200;
+        if (count($students) > $chunkLimit) {
+            $students = array_slice($students, 0, $chunkLimit);
+        }
+
+        // ── Build ZIP ──
+        $zip     = new \ZipArchive();
+        $zipName = 'export_' . date('Ymd_His');
+        if ($filterDept)   $zipName .= '_' . preg_replace('/[^a-z0-9]/i', '', $filterDept);
+        if ($filterStatus) $zipName .= '_' . $filterStatus;
+        $zipName .= '.zip';
+
+        // Ensure writable uploads dir exists
+        $writableDir = WRITEPATH . 'uploads/';
+        if (!is_dir($writableDir)) mkdir($writableDir, 0775, true);
+        $zipPath = $writableDir . $zipName;
+
+        if ($zip->open($zipPath, \ZipArchive::CREATE) !== true) {
+            return redirect()->back()->with('error', 'Could not create ZIP archive.');
+        }
+
+        foreach ($students as $student) {
+            $safeName = preg_replace('/[^a-z0-9_]/i', '_', $student['name']);
+            $folder   = $safeName . '_ID' . $student['id'] . '/';
+
+            $fileMap = [
+                'Photos'       => [FCPATH . 'uploads/profile/',   $student['profile_photo']],
+                'Resumes'      => [FCPATH . 'uploads/resume/',    $student['resume']],
+                'ID_Proofs'    => [FCPATH . 'uploads/id_proof/',  $student['id_proof']],
+                'Signatures'   => [FCPATH . 'uploads/signature/', $student['signature']],
+            ];
+
+            foreach ($fileMap as $category => [$dir, $file]) {
+                if ($file && file_exists($dir . $file)) {
+                    $zip->addFile($dir . $file, $folder . $category . '/' . $file);
+                }
+            }
+
+            // Certificates sub-folder
+            $certs = $certificateModel->where('student_id', $student['id'])->findAll();
+            foreach ($certs as $cert) {
+                $certPath = FCPATH . 'uploads/certificates/' . $cert['file_name'];
+                if (file_exists($certPath)) {
+                    $zip->addFile($certPath, $folder . 'Certificates/' . $cert['file_name']);
+                }
+            }
+        }
+
+        $zip->close();
+
+        // Send and delete the temp file after download
+        return $this->response
+            ->setHeader('Content-Disposition', 'attachment; filename="' . $zipName . '"')
+            ->download($zipPath, null);
+    }
+
+    public function updateStatus($id)
+    {
+        $studentModel = new StudentModel();
+        $status = $this->request->getPost('status');
+        
+        if (in_array($status, ['pending', 'approved', 'rejected'])) {
+            $studentModel->update($id, ['status' => $status]);
+            return $this->response->setJSON(['status' => 'success', 'message' => 'Status updated to ' . $status]);
+        }
+        
+        return $this->response->setJSON(['status' => 'error', 'message' => 'Invalid status']);
+    }
 
     public function delete($id)
     {
